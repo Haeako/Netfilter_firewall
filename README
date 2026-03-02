@@ -1,0 +1,21 @@
+# Compile
+make
+
+# Load module
+sudo insmod firewall.ko
+
+# Kiểm tra module đã load
+lsmod | grep firewall
+dmesg | tail
+
+# Xem IP hiện tại
+cat /proc/firewall_config
+
+# Thay đổi IP
+echo "10.0.0.5" | sudo tee /proc/firewall_config
+
+# Kiểm tra log
+dmesg | tail
+
+# Unload module
+sudo rmmod firewall
