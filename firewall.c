@@ -17,8 +17,6 @@ unsigned int hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_sta
     ip_header = ip_hdr(skb);
     if (!ip_header)
         return NF_ACCEPT;
-
-    // Sử dụng blocked_ip_binary thay vì in_aton(BLOCKED_IP)
     if (ip_header->saddr == blocked_ip_binary)
     {
         printk(KERN_INFO "Firewall: Blocked IP %pI4\n", &ip_header->saddr);
