@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0
  * nf_antidos/core/nf_antidos.c
- *   Layer 1: Blacklist check      (O(1) hashtable)
- *   Layer 2: Connection limit     (per-IP conn counter)
- *   Layer 3: Rate limit plugin    (swap được qua /proc)
- *   Layer 4: Auto-ban             (violation threshold → ban TTL)
+ *    1: Blacklist check      (O(1) hashtable)
+ *    2: Connection limit     (per-IP conn counter)
+ *    3: Rate limit plugin    (swap được qua /proc)
+ *    4: Auto-ban             (violation threshold → ban TTL)
  *
  * /proc interface:
  *   /proc/nf_antidos/plugin   — đọc/ghi tên plugin active
@@ -33,7 +33,7 @@ MODULE_DESCRIPTION(
     "Anti-DoS Netfilter firewall — plugin rate-limit, conn limit, auto-ban");
 MODULE_VERSION("1.0");
 
-/* ─── Config ─────────────────────────────────────────────────────────────── */
+/*  Config  */
 static unsigned int max_conn_per_ip = 20;
 static unsigned int ban_threshold = 5;   /* violation trước khi ban */
 static unsigned int ban_ttl_sec = 300;   /* giây bị ban */
@@ -45,19 +45,29 @@ module_param(ban_threshold, uint, 0644);
 module_param(ban_ttl_sec, uint, 0644);
 module_param(entry_ttl_sec, uint, 0644);
 
-/* ─── Blacklist entry ───────────────────────────────────────────────────────
+/*  Blacklist entry 
  */
 #define BL_HASH_BITS 10
 struct ban_entry {
   __be32 src_ip;
-  unsigned long expires; /* jiffies hết hạn ban */
+  unsigned long expires; /* jiffies ban's expriness */
   struct hlist_node hnode;
 };
 
 static DEFINE_HASHTABLE(ban_table, BL_HASH_BITS);
 static DEFINE_SPINLOCK(ban_lock);
 
-/* ─── Connection count table ────────────────────────────────────────────────
+/*  Whitelist entry 
+ */
+struct whitelist_entry {
+  __be32 ip;
+  struct hlist_node hnode;
+};
+
+static DEFINE_HASHTABLE(whitelist_table, BL_HASH_BITS);
+static DEFINE_SPINLOCK(whitelist_lock);
+
+/*  Connection count table 
  */
 #define CC_HASH_BITS 10
 struct conn_entry {
@@ -71,20 +81,20 @@ struct conn_entry {
 static DEFINE_HASHTABLE(conn_table, CC_HASH_BITS);
 static DEFINE_SPINLOCK(conn_lock);
 
-/* ─── Rate-limit entry table (plugin-owned state) ────────────────────────── */
+/*  Rate-limit entry table (plugin-owned state)  */
 #define RL_HASH_BITS 10
 static DEFINE_HASHTABLE(rl_table, RL_HASH_BITS);
 static DEFINE_SPINLOCK(rl_lock);
 
-/* ─── Plugin registry ────────────────────────────────────────────────────── */
+/*  Plugin registry  */
 static LIST_HEAD(plugin_list);
 static DEFINE_SPINLOCK(plugin_list_lock);
 static struct rl_plugin *active_plugin = NULL;
 
+/*Install plugin*/
 int rl_plugin_register(struct rl_plugin *p) {
   spin_lock(&plugin_list_lock);
   list_add(&p->list, &plugin_list);
-  /* đặt plugin đầu tiên đăng ký làm default */
   if (!active_plugin)
     active_plugin = p;
   spin_unlock(&plugin_list_lock);
@@ -93,6 +103,7 @@ int rl_plugin_register(struct rl_plugin *p) {
 }
 EXPORT_SYMBOL(rl_plugin_register);
 
+/*Remove plugin*/
 void rl_plugin_unregister(struct rl_plugin *p) {
   spin_lock(&plugin_list_lock);
   list_del(&p->list);
@@ -108,7 +119,7 @@ EXPORT_SYMBOL(rl_plugin_unregister);
 
 struct rl_plugin *rl_plugin_get_active(void) { return active_plugin; }
 EXPORT_SYMBOL(rl_plugin_get_active);
-
+/* Active plugin*/
 int rl_plugin_set_active(const char *name) {
   struct rl_plugin *p;
   spin_lock(&plugin_list_lock);
@@ -125,14 +136,14 @@ int rl_plugin_set_active(const char *name) {
 }
 EXPORT_SYMBOL(rl_plugin_set_active);
 
-/* ─── Thống kê ───────────────────────────────────────────────────────────── */
+/*  Thống kê  */
 static atomic64_t stat_accepted = ATOMIC64_INIT(0);
 static atomic64_t stat_dropped_bl = ATOMIC64_INIT(0); /* blacklist */
 static atomic64_t stat_dropped_cc = ATOMIC64_INIT(0); /* conn limit */
 static atomic64_t stat_dropped_rl = ATOMIC64_INIT(0); /* rate limit */
 static atomic64_t stat_auto_bans = ATOMIC64_INIT(0);
 
-/* ─── Helpers: blacklist ────────────────────────────────────────────────────
+/*  Helpers: blacklist 
  */
 static bool bl_is_banned(__be32 ip) {
   struct ban_entry *e;
@@ -172,7 +183,58 @@ static void bl_ban_ip(__be32 ip) {
   pr_info_ratelimited("nf_antidos: auto-ban %pI4 for %us\n", &ip, ban_ttl_sec);
 }
 
-/* ─── Helpers: connection count ──────────────────────────────────────────── */
+/*  Helpers: whitelist 
+ */
+static bool wl_is_whitelisted(__be32 ip) {
+  struct whitelist_entry *e;
+  bool found = false;
+
+  spin_lock_bh(&whitelist_lock);
+  hash_for_each_possible(whitelist_table, e, hnode, (u32)ip) {
+    if (e->ip == ip) {
+      found = true;
+      break;
+    }
+  }
+  spin_unlock_bh(&whitelist_lock);
+  return found;
+}
+
+static void wl_add_ip(__be32 ip) {
+  struct whitelist_entry *e;
+
+  spin_lock_bh(&whitelist_lock);
+  /* check duplicate */
+  hash_for_each_possible(whitelist_table, e, hnode, (u32)ip) {
+    if (e->ip == ip) {
+      spin_unlock_bh(&whitelist_lock);
+      return;
+    }
+  }
+
+  e = kmalloc(sizeof(*e), GFP_ATOMIC);
+  if (e) {
+    e->ip = ip;
+    hash_add(whitelist_table, &e->hnode, (u32)ip);
+  }
+  spin_unlock_bh(&whitelist_lock);
+}
+
+static void wl_del_ip(__be32 ip) {
+  struct whitelist_entry *e;
+  struct hlist_node *tmp;
+
+  spin_lock_bh(&whitelist_lock);
+  hash_for_each_possible_safe(whitelist_table, e, tmp, hnode, (u32)ip) {
+    if (e->ip == ip) {
+      hash_del(&e->hnode);
+      kfree(e);
+    }
+  }
+  spin_unlock_bh(&whitelist_lock);
+}
+
+/*  Helpers: connection count  */
 static struct conn_entry *cc_get_or_create(__be32 ip) {
   struct conn_entry *e;
 
@@ -193,7 +255,7 @@ static struct conn_entry *cc_get_or_create(__be32 ip) {
   return e;
 }
 
-/* ─── Helpers: rate-limit entry ──────────────────────────────────────────── */
+/*rate-limit entry*/
 static struct rl_entry *rl_get_or_create(__be32 ip, struct rl_plugin *plugin) {
   struct rl_entry *e;
 
@@ -214,7 +276,7 @@ static struct rl_entry *rl_get_or_create(__be32 ip, struct rl_plugin *plugin) {
   return e;
 }
 
-/* ─── Netfilter hook ─────────────────────────────────────────────────────── */
+/* Standard Callback Netfilter hook  */
 static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
                                  const struct nf_hook_state *state) {
   struct iphdr *iph;
@@ -225,12 +287,21 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
 
   if (!skb)
     return NF_ACCEPT;
+
+  // check loopback
+  if ((skb->dev && (skb->dev->flags & IFF_LOOPBACK)))
+    return NF_ACCEPT;
+
   iph = ip_hdr(skb);
   if (!iph)
     return NF_ACCEPT;
   src = iph->saddr;
 
-  /* ── Layer 1: Blacklist ─────────────────────────── */
+  /*  Whitelist check  */
+  if (wl_is_whitelisted(src))
+    return NF_ACCEPT;
+
+  /*  Layer 1: Blacklist  */
   spin_lock_bh(&ban_lock);
   if (bl_is_banned(src)) {
     spin_unlock_bh(&ban_lock);
@@ -239,29 +310,35 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
   }
   spin_unlock_bh(&ban_lock);
 
-  /* ── Layer 2: Connection limit ──────────────────── */
+  /*  Layer 2: Connection limit  */
   spin_lock_bh(&conn_lock);
   cc = cc_get_or_create(src);
   if (cc) {
-    int cur = atomic_read(&cc->count);
-    if (cur >= (int)max_conn_per_ip) {
-      cc->violations++;
-      if (cc->violations >= ban_threshold) {
-        /* ban IP, reset counter */
-        spin_lock_bh(&ban_lock);
-        bl_ban_ip(src);
-        spin_unlock_bh(&ban_lock);
-        cc->violations = 0;
+    /* Check TCP SYN packet */
+    if (iph->protocol == IPPROTO_TCP) {
+      struct tcphdr *th = tcp_hdr(skb);
+      if (th->syn && !th->ack) {
+        int cur = atomic_read(&cc->count);
+        if (cur >= (int)max_conn_per_ip) {
+          cc->violations++;
+          if (cc->violations >= ban_threshold) {
+            /* ban IP, reset counter */
+            spin_lock_bh(&ban_lock);
+            bl_ban_ip(src);
+            spin_unlock_bh(&ban_lock);
+            cc->violations = 0;
+          }
+          spin_unlock_bh(&conn_lock);
+          atomic64_inc(&stat_dropped_cc);
+          return NF_DROP;
+        }
+        atomic_inc(&cc->count);
       }
-      spin_unlock_bh(&conn_lock);
-      atomic64_inc(&stat_dropped_cc);
-      return NF_DROP;
     }
-    atomic_inc(&cc->count);
   }
   spin_unlock_bh(&conn_lock);
 
-  /* ── Layer 3: Rate-limit plugin ─────────────────── */
+  /*   3: Rate-limit plugin  */
   spin_lock_bh(&plugin_list_lock);
   plugin = active_plugin;
   spin_unlock_bh(&plugin_list_lock);
@@ -297,7 +374,7 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
   return NF_ACCEPT;
 }
 
-/* ─── Cleanup timer ──────────────────────────────────────────────────────── */
+/*  Cleanup timer  */
 static struct timer_list cleanup_timer;
 
 static void do_cleanup(struct timer_list *t) {
@@ -348,7 +425,7 @@ static void do_cleanup(struct timer_list *t) {
   mod_timer(&cleanup_timer, jiffies + cleanup_sec * HZ);
 }
 
-/* ─── /proc interface ────────────────────────────────────────────────────── */
+/*  /proc interface  */
 static struct proc_dir_entry *proc_dir;
 
 /* /proc/nf_antidos/plugin — đọc/ghi tên plugin */
@@ -438,7 +515,56 @@ static const struct proc_ops proc_banned_ops = {
     .proc_release = single_release,
 };
 
-/* ─── Netfilter ops ─────────────────────────────────────────────────────────
+/* /proc/nf_antidos/whitelist */
+static int proc_whitelist_show(struct seq_file *m, void *v) {
+  struct whitelist_entry *e;
+  int bkt;
+
+  spin_lock_bh(&whitelist_lock);
+  hash_for_each(whitelist_table, bkt, e, hnode) {
+    seq_printf(m, "%pI4\n", &e->ip);
+  }
+  spin_unlock_bh(&whitelist_lock);
+  return 0;
+}
+
+static ssize_t proc_whitelist_write(struct file *f, const char __user *buf,
+                                    size_t len, loff_t *off) {
+  char cmd[64] = {};
+  char ip_str[32] = {};
+  __be32 ip;
+
+  if (len >= sizeof(cmd))
+    return -EINVAL;
+  if (copy_from_user(cmd, buf, len))
+    return -EFAULT;
+
+  if (sscanf(cmd, "add %31s", ip_str) == 1) {
+    ip = in_aton(ip_str);
+    wl_add_ip(ip);
+  } else if (sscanf(cmd, "del %31s", ip_str) == 1) {
+    ip = in_aton(ip_str);
+    wl_del_ip(ip);
+  } else {
+    return -EINVAL;
+  }
+
+  return len;
+}
+
+static int proc_whitelist_open(struct inode *i, struct file *f) {
+  return single_open(f, proc_whitelist_show, NULL);
+}
+
+static const struct proc_ops proc_whitelist_ops = {
+    .proc_open = proc_whitelist_open,
+    .proc_read = seq_read,
+    .proc_write = proc_whitelist_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+/*  Netfilter ops 
  */
 static struct nf_hook_ops nf_ops = {
     .hook = antidos_hook,
@@ -447,7 +573,7 @@ static struct nf_hook_ops nf_ops = {
     .priority = NF_IP_PRI_FIRST,
 };
 
-/* ─── Module init / exit ────────────────────────────────────────────────────
+/*  Module init / exit 
  */
 static int __init antidos_init(void) {
   int ret;
@@ -470,6 +596,7 @@ static int __init antidos_init(void) {
     proc_create("plugin", 0644, proc_dir, &proc_plugin_ops);
     proc_create("stats", 0444, proc_dir, &proc_stats_ops);
     proc_create("banned", 0444, proc_dir, &proc_banned_ops);
+    proc_create("whitelist", 0644, proc_dir, &proc_whitelist_ops);
   }
 
   pr_info("nf_antidos: loaded — max_conn=%u ban_thresh=%u ban_ttl=%us\n",
@@ -488,8 +615,19 @@ static void __exit antidos_exit(void) {
     remove_proc_entry("plugin", proc_dir);
     remove_proc_entry("stats", proc_dir);
     remove_proc_entry("banned", proc_dir);
+    remove_proc_entry("whitelist", proc_dir);
     remove_proc_entry("nf_antidos", NULL);
   }
+
+  spin_lock_bh(&whitelist_lock);
+  {
+    struct whitelist_entry *e;
+    hash_for_each_safe(whitelist_table, bkt, tmp, e, hnode) {
+      hash_del(&e->hnode);
+      kfree(e);
+    }
+  }
+  spin_unlock_bh(&whitelist_lock);
 
   spin_lock_bh(&ban_lock);
   {
