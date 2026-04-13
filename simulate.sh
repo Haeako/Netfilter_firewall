@@ -7,6 +7,3 @@ cat /proc/nf_antidos/banned        # xem danh sách + TTL còn lại
 echo "add 192.168.2.18" | sudo tee /proc/nf_antidos/whitelist
 echo "del 192.168.2.18" | sudo tee /proc/nf_antidos/whitelist
 cat /proc/nf_antidos/whitelist     # xem danh sách
-
-#tmux
-# : watch -n 1 cat /proc/nf_antidos/stats (ban/white)
