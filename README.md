@@ -31,14 +31,6 @@ Module `nf_antidos` là một firewall stateless hoạt động tại kernel spa
    - Tự động cộng thêm tokens theo thời gian
    - Tính toán dựa trên jiffies (clock ticks của kernel)
 
-### 3. **Cơ chế Cấm (Ban Mechanism)**
-   - Tự động cấm IP vượt quá giới hạn
-   - Hỗ trợ cấm tự động và cấm thủ công
-   - Thời gian cấm có thể cấu hình
-
-### 4. **Danh Sách Trắng (Whitelist)**
-   - Cho phép các IP tin tưởng bỏ qua kiểm soát
-
 ### 5. **Thống Kê Thời Gian Thực**
    - Số gói tin được chấp nhận
    - Số gói tin bị hủy
