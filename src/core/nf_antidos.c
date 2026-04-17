@@ -73,7 +73,7 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
 
     if (!skb) return NF_ACCEPT;
     iph = ip_hdr(skb);
-    if (!iph) return NF_ACCEPT;
+    if (!iph) return NF_DROP;
 
     /* Bỏ qua loopback */
     if (skb->dev && (skb->dev->flags & IFF_LOOPBACK))
