@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * nf_antidos.c - Version 1.5 (Removed WEB filtering)
- *
+ * nf_antidos.c - Version 2.1 (Single token bucket per IP, all protocols)
  */
 
 #include <linux/module.h>
@@ -8,29 +7,21 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/icmp.h>
 #include <linux/hashtable.h>
 #include <linux/timer.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/inet.h>
 #include <linux/slab.h>
 
 #define ANTIDOS_HASH_BITS 10
 #define MAX_DOS_ENTRIES 4096
 
 struct dos_entry {
-    __be32 src_ip;
+    __be32        src_ip;
     unsigned long last_seen;
     unsigned long ban_until;
-
-    unsigned long last_refill_syn;
-    unsigned long last_refill_icmp;
-
-    uint32_t tokens_syn;
-    uint32_t tokens_icmp;
-
+    unsigned long last_refill;
+    uint32_t      tokens;
     struct hlist_node hnode;
 };
 
@@ -38,33 +29,28 @@ static DEFINE_HASHTABLE(dos_table, ANTIDOS_HASH_BITS);
 static DEFINE_SPINLOCK(antidos_lock);
 static atomic_t entry_count = ATOMIC_INIT(0);
 
-static unsigned int rate_syn   = 20;
-static unsigned int rate_icmp  = 5;
-static unsigned int burst_syn  = 30;
-static unsigned int burst_icmp = 10;
-static unsigned int ban_sec    = 300;
+static unsigned int rate    = 50;
+static unsigned int burst   = 5000;
+static unsigned int ban_sec = 30;
 
-module_param(rate_syn,   uint, 0);
-module_param(rate_icmp,  uint, 0);
-module_param(burst_syn,  uint, 0);
-module_param(burst_icmp, uint, 0);
-module_param(ban_sec,    uint, 0);
+module_param(rate,    uint, 0644);
+module_param(burst,   uint, 0644);
+module_param(ban_sec, uint, 0644);
 
 static atomic64_t stat_accepted = ATOMIC64_INIT(0);
 static atomic64_t stat_dropped  = ATOMIC64_INIT(0);
 static atomic64_t stat_bans     = ATOMIC64_INIT(0);
 
-static bool token_bucket_check(uint32_t *tokens, unsigned int rate,
-                                unsigned long *last_jiffies, unsigned int max_burst)
+static bool token_bucket_check(uint32_t *tokens, unsigned long *last_jiffies)
 {
-    unsigned long now  = jiffies;
-    unsigned long diff = now - *last_jiffies;
-    uint32_t refill    = (jiffies_to_msecs(diff) * rate) / 1000;
+    unsigned long now   = jiffies;
+    unsigned long diff  = now - *last_jiffies;
+    uint32_t refill     = (uint32_t)(jiffies_to_msecs(diff) * rate / 1000);
 
     if (refill > 0) {
         *tokens += refill;
-        if (*tokens > max_burst)
-            *tokens = max_burst;
+        if (*tokens > burst)
+            *tokens = burst;
         *last_jiffies = now;
     }
 
@@ -81,36 +67,34 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
                                   const struct nf_hook_state *state)
 {
     struct iphdr     *iph;
-    struct tcphdr    *th;
     struct dos_entry *found;
     __be32 src;
-    bool allowed = true;
-    unsigned int ip_hlen;
+    bool allowed;
 
     if (!skb) return NF_ACCEPT;
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
-    src     = iph->saddr;
-    found   = NULL;
-    ip_hlen = iph->ihl * 4;
+    /* Bỏ qua loopback */
+    if (skb->dev && (skb->dev->flags & IFF_LOOPBACK))
+        return NF_ACCEPT;
+
+    src = iph->saddr;
 
     spin_lock_bh(&antidos_lock);
 
-    /* Bỏ qua traffic nội bộ */
-    if (skb->dev && (skb->dev->flags & IFF_LOOPBACK)) {
-        spin_unlock_bh(&antidos_lock);
-        return NF_ACCEPT;
-    }
-
-    /* 1. Tìm hoặc tạo IP entry */
+    /* 1. Tìm entry */
+    found = NULL;
     hash_for_each_possible(dos_table, found, hnode, (u32)src) {
         if (found->src_ip == src) break;
+        found = NULL;
     }
 
+    /* 2. Tạo mới nếu chưa có */
     if (!found) {
         if (atomic_read(&entry_count) >= MAX_DOS_ENTRIES) {
             spin_unlock_bh(&antidos_lock);
+            atomic64_inc(&stat_dropped);
             return NF_DROP;
         }
         found = kmalloc(sizeof(*found), GFP_ATOMIC);
@@ -118,20 +102,16 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
             spin_unlock_bh(&antidos_lock);
             return NF_ACCEPT;
         }
-
-        found->src_ip           = src;
-        found->last_seen        = jiffies;
-        found->ban_until        = 0;
-        found->last_refill_syn  = jiffies;
-        found->last_refill_icmp = jiffies;
-        found->tokens_syn       = burst_syn;
-        found->tokens_icmp      = burst_icmp;
-
+        found->src_ip      = src;
+        found->last_seen   = jiffies;
+        found->ban_until   = 0;
+        found->last_refill = jiffies;
+        found->tokens      = burst;
         hash_add(dos_table, &found->hnode, (u32)src);
         atomic_inc(&entry_count);
     }
 
-    /* 2. Check ban BAN */
+    /* 3. Đang bị ban? */
     if (found->ban_until && time_before(jiffies, found->ban_until)) {
         found->last_seen = jiffies;
         spin_unlock_bh(&antidos_lock);
@@ -139,34 +119,15 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
         return NF_DROP;
     }
 
-    /* 3. ( SYN & ICMP) */
-    if (iph->protocol == IPPROTO_TCP) {
-        if (skb->len >= ip_hlen + sizeof(struct tcphdr)) {
-            th = (struct tcphdr *)((u8 *)iph + ip_hlen);
-            if (th->syn && !th->ack) {
-                allowed = token_bucket_check(&found->tokens_syn,
-                                             rate_syn,
-                                             &found->last_refill_syn,
-                                             burst_syn);
-            }
-        }
-    } else if (iph->protocol == IPPROTO_ICMP) {
-        allowed = token_bucket_check(&found->tokens_icmp,
-                                     rate_icmp,
-                                     &found->last_refill_icmp,
-                                     burst_icmp);
-    }
-
+    /* 4. Token bucket */
+    allowed = token_bucket_check(&found->tokens, &found->last_refill);
     found->last_seen = jiffies;
 
-    /* ban*/
     if (!allowed) {
         found->ban_until = jiffies + (ban_sec * HZ);
         atomic64_inc(&stat_bans);
-        pr_warn_ratelimited("nf_antidos: BAN %pI4 for %u sec (SYN/ICMP tokens: %u/%u)\n",
-                            &found->src_ip, ban_sec,
-                            found->tokens_syn,
-                            found->tokens_icmp);
+        pr_warn_ratelimited("nf_antidos: BAN %pI4 for %u sec\n",
+                            &found->src_ip, ban_sec);
         spin_unlock_bh(&antidos_lock);
         atomic64_inc(&stat_dropped);
         return NF_DROP;
@@ -177,7 +138,7 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
     return NF_ACCEPT;
 }
 
-/* ================== GIAO DIỆN /PROC ================== */
+/* ================== /PROC ================== */
 
 static int proc_stats_show(struct seq_file *m, void *v)
 {
@@ -186,18 +147,13 @@ static int proc_stats_show(struct seq_file *m, void *v)
         "Dropped:   %lld\n"
         "Auto-Bans: %lld\n"
         "Entries:   %d/%d\n"
-        "\n"
-        "--- Config ---\n"
-        "rate_syn=%u/s  burst_syn=%u\n"
-        "rate_icmp=%u/s burst_icmp=%u\n"
-        "ban_sec=%u\n",
+        "\n--- Config ---\n"
+        "rate=%u/s  burst=%u  ban_sec=%u\n",
         atomic64_read(&stat_accepted),
         atomic64_read(&stat_dropped),
         atomic64_read(&stat_bans),
         atomic_read(&entry_count), MAX_DOS_ENTRIES,
-        rate_syn,  burst_syn,
-        rate_icmp, burst_icmp,
-        ban_sec);
+        rate, burst, ban_sec);
     return 0;
 }
 
@@ -224,30 +180,26 @@ static int proc_ips_show(struct seq_file *m, void *v)
     int bkt;
     unsigned long now = jiffies;
 
-    seq_printf(m, "%-18s %-8s %-10s %-10s %-12s\n",
-               "IP", "Status", "SYN_tok", "ICMP_tok", "Ban_remain(s)");
-    seq_puts(m, "------------------------------------------------------------\n");
-    seq_printf(m, "%-18s %-8s %-10u %-10u\n",
-               "(max)", "", burst_syn, burst_icmp);
-    seq_puts(m, "------------------------------------------------------------\n");
+    seq_printf(m, "%-18s %-8s %-10s %-12s\n",
+               "IP", "Status", "Tokens", "Ban_remain(s)");
+    seq_puts(m, "---------------------------------------------------\n");
+    seq_printf(m, "%-18s %-8s %-10u\n", "(max)", "", burst);
+    seq_puts(m, "---------------------------------------------------\n");
 
     spin_lock_bh(&antidos_lock);
     hash_for_each(dos_table, bkt, e, hnode) {
         bool banned       = e->ban_until && time_before(now, e->ban_until);
         unsigned long rem = banned ? (e->ban_until - now) / HZ : 0;
-
-        seq_printf(m, "%-18pI4 %-8s %-10u %-10u %-12lu\n",
+        seq_printf(m, "%-18pI4 %-8s %-10u %-12lu\n",
                    &e->src_ip,
                    banned ? "BANNED" : "OK",
-                   e->tokens_syn,
-                   e->tokens_icmp,
-                   rem);
+                   e->tokens, rem);
     }
     spin_unlock_bh(&antidos_lock);
     return 0;
 }
 
-/* ================== DỌN DẸP & KHỞI TẠO ================== */
+/* ================== CLEANUP & INIT ================== */
 
 static struct timer_list cleanup_timer;
 
@@ -285,7 +237,8 @@ static int __init antidos_init(void)
     proc_create_single("nf_antidos_stats",  0444, NULL, proc_stats_show);
     proc_create_single("nf_antidos_banned", 0444, NULL, proc_banned_show);
     proc_create_single("nf_antidos_ips",    0444, NULL, proc_ips_show);
-    pr_info("nf_antidos: module loaded successfully\n");
+    pr_info("nf_antidos: loaded (rate=%u/s burst=%u ban=%us)\n",
+            rate, burst, ban_sec);
     return 0;
 }
 
