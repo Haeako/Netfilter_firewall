@@ -95,7 +95,7 @@ static unsigned int antidos_hook(void *priv, struct sk_buff *skb,
         if (atomic_read(&entry_count) >= MAX_DOS_ENTRIES) {
             spin_unlock_bh(&antidos_lock);
             atomic64_inc(&stat_dropped);
-            return NF_ACCEPT;
+            return NF_DROP;
         }
         found = kmalloc(sizeof(*found), GFP_ATOMIC);
         if (!found) {
